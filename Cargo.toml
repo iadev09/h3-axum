@@ -8,7 +8,7 @@ authors = [
 ]
 description = "Transport your Axum router over HTTP/3. Use your existing handlers with QUIC."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/claviron/h3-axum"
+repository = "https://github.com/iadev09/h3-axum"
 keywords = ["http3", "quic", "axum", "quinn", "h3"]
 categories = ["network-programming", "web-programming::http-server"]
 
