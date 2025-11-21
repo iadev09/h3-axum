@@ -25,7 +25,7 @@ use std::error::Error;
 
 use bytes::{Buf, Bytes};
 use http::{Request, Response};
-use http_body_util::BodyExt;
+use http_body_util;
 
 /// Boxed error type
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -135,10 +135,15 @@ where
     let head_only: Response<()> = Response::from_parts(parts, ());
     stream.send_response(head_only).await?;
 
-    // Stream response body
-    let body_bytes = axum_body.collect().await?.to_bytes();
-    if !body_bytes.is_empty() {
-        stream.send_data(body_bytes.into()).await?;
+    // Stream response body chunk by chunk for SSE support
+    let mut body_stream = std::pin::pin!(axum_body);
+    while let Some(frame_result) = http_body_util::BodyExt::frame(&mut body_stream).await {
+        let frame = frame_result?;
+        if let Some(chunk) = frame.data_ref() {
+            if !chunk.is_empty() {
+                stream.send_data(chunk.clone().into()).await?;
+            }
+        }
     }
 
     stream.finish().await?;
