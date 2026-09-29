@@ -61,7 +61,30 @@ pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 /// }
 /// ```
 pub fn is_graceful_h3_close(err: &h3::error::ConnectionError) -> bool {
-    err.is_h3_no_error()
+    // h3 0.0.8 maps transport-level QUIC ConnectionClosed errors to
+    // Undefined, so its typed predicate cannot yet recognize that graceful
+    // close. Keep the compatibility inspection until hyperium/h3#336 is part
+    // of a published h3 release.
+    let err_debug = format!("{err:?}");
+
+    if err_debug.contains("NO_ERROR")
+        || err_debug.contains("ApplicationClose: 0x0")
+        || err_debug.contains("ApplicationClose(0x0)")
+        || err_debug.contains("ConnectionClosed")
+    {
+        return true;
+    }
+
+    let mut source: &(dyn Error + 'static) = err;
+    while let Some(error) = source.source() {
+        let source_debug = format!("{error:?}");
+        if source_debug.contains("NO_ERROR") || source_debug.contains("ApplicationClose") {
+            return true;
+        }
+        source = error;
+    }
+
+    false
 }
 
 /// An Axum request body backed directly by an HTTP/3 receive stream.
