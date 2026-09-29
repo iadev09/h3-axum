@@ -21,6 +21,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod connection;
+#[cfg(feature = "webtransport")]
+mod webtransport;
+
 use std::{
     error::Error,
     pin::Pin,
@@ -30,6 +34,10 @@ use std::{
 use bytes::{Buf, Bytes};
 use http::{Request, Response};
 use http_body::{Body, Frame};
+
+pub use connection::serve_h3_connection_with_axum;
+#[cfg(feature = "webtransport")]
+pub use webtransport::{WebTransportSession, WebTransportUpgrade, WebTransportUpgradeError};
 
 /// Boxed error type
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -156,7 +164,20 @@ where
 {
     // Resolve the H3 request
     let (request_head, stream) = resolver.resolve_request().await?;
-    let (mut send_stream, recv_stream) = stream.split();
+    serve_resolved_h3_with_axum::<Q>(app, request_head, stream).await
+}
+
+pub(crate) async fn serve_resolved_h3_with_axum<Q>(
+    app: axum::Router,
+    request_head: Request<()>,
+    stream: h3::server::RequestStream<Q::BidiStream, Bytes>,
+) -> Result<(), BoxError>
+where
+    Q: h3::quic::Connection<Bytes>,
+    Q::BidiStream: h3::quic::BidiStream<Bytes>,
+    <Q::BidiStream as h3::quic::BidiStream<Bytes>>::RecvStream: Send + Unpin + 'static,
+{
+    let (send_stream, recv_stream) = stream.split();
 
     // Build Axum request
     let (parts, _) = request_head.into_parts();
@@ -166,6 +187,16 @@ where
     // Call Axum router
     let axum_resp = tower::ServiceExt::oneshot(app, axum_req).await?;
 
+    send_axum_response(send_stream, axum_resp).await
+}
+
+pub(crate) async fn send_axum_response<S>(
+    mut send_stream: h3::server::RequestStream<S, Bytes>,
+    axum_resp: Response<axum::body::Body>,
+) -> Result<(), BoxError>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     // Send response back over H3
     let (parts, axum_body) = axum_resp.into_parts();
     let head_only: Response<()> = Response::from_parts(parts, ());

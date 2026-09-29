@@ -47,7 +47,12 @@ h3_axum::serve_h3_with_axum(app, resolver).await?;
 if h3_axum::is_graceful_h3_close( & err) { /* ... */ }
 ```
 
-That's the entire library.
+For callers that want the crate to drive a complete Quinn-backed connection,
+the connection-level API dispatches every request through the same router:
+
+```rust
+h3_axum::serve_h3_connection_with_axum(app, h3_conn).await?;
+```
 
 The bridge preserves the HTTP message rather than collecting it into one
 buffer:
@@ -74,6 +79,58 @@ The required upstream work is already merged:
   `ConnectionClosed` errors as structured values. The adapter already uses
   `ConnectionError::is_h3_no_error()`, so a dependency update will extend its
   graceful-close classification without debug-string parsing.
+
+## WebTransport
+
+WebTransport is opt-in because it adds the `h3-webtransport` and H3 datagram
+dependencies:
+
+```toml
+h3-axum = { version = "0.3", features = ["webtransport"] }
+```
+
+The connection driver recognizes a WebTransport extended CONNECT request and
+sends it through the same Axum router as ordinary HTTP/3 requests. The handler
+claims the connection with the `WebTransportUpgrade` extractor:
+
+```rust
+use axum::{Router, routing::{any, get}};
+use h3_axum::WebTransportUpgrade;
+
+let app = Router::new()
+    .route("/health", get(|| async { "ok" }))
+    // `WebTransportUpgrade` rejects ordinary requests, so this route still
+    // handles only a WebTransport extended CONNECT.
+    .route("/session", any(webtransport));
+
+async fn webtransport(upgrade: WebTransportUpgrade) {
+    let session = upgrade.accept().await.expect("accept WebTransport session");
+
+    // Own and drive `session` here until this WebTransport session ends.
+    // For example: session.accept_bi().await, accept_uni(), or datagrams.
+    run_session(session).await;
+}
+
+let mut builder = h3::server::builder();
+builder
+    .enable_webtransport(true)
+    .enable_extended_connect(true)
+    .enable_datagram(true)
+    .max_webtransport_sessions(1);
+
+let connection = builder
+    .build(h3_quinn::Connection::new(quinn_connection))
+    .await?;
+h3_axum::serve_h3_connection_with_axum(app, connection).await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`accept()` must be awaited before the handler returns. A successful claim
+transfers the complete HTTP/3 connection to the WebTransport session; the
+handler's Axum response is therefore not sent. If a matching route chooses not
+to call `accept()`, its normal Axum response is sent and the connection driver
+continues accepting HTTP/3 requests. Listener ownership, TLS, QUIC transport
+configuration and the WebTransport session loop remain application policy.
 
 ---
 

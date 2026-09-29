@@ -31,6 +31,10 @@ struct TestServer {
 
 impl TestServer {
     async fn spawn(app: Router) -> Self {
+        Self::spawn_with_connection_driver(app, false).await
+    }
+
+    async fn spawn_with_connection_driver(app: Router, connection_driver: bool) -> Self {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
@@ -57,11 +61,34 @@ impl TestServer {
         let task = tokio::spawn(async move {
             let incoming = endpoint.accept().await.expect("accept QUIC connection");
             let connection = incoming.await.expect("complete QUIC handshake");
-            let mut h3 = h3::server::builder()
+            #[cfg(feature = "webtransport")]
+            let builder = {
+                let mut builder = h3::server::builder();
+                if connection_driver {
+                    builder
+                        .enable_webtransport(true)
+                        .enable_extended_connect(true)
+                        .enable_datagram(true)
+                        .max_webtransport_sessions(1);
+                }
+                builder
+            };
+            #[cfg(not(feature = "webtransport"))]
+            let builder = h3::server::builder();
+
+            let h3 = builder
                 .build(h3_quinn::Connection::new(connection))
                 .await
                 .expect("build H3 server connection");
 
+            if connection_driver {
+                h3_axum::serve_h3_connection_with_axum(app, h3)
+                    .await
+                    .expect("serve Axum H3 connection");
+                return;
+            }
+
+            let mut h3 = h3;
             while let Some(resolver) = h3.accept().await.expect("accept H3 request") {
                 let app = app.clone();
                 tokio::spawn(async move {
@@ -81,6 +108,17 @@ impl TestServer {
 
     async fn connect(
         &self,
+    ) -> (
+        quinn::Endpoint,
+        h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        self.connect_with_extended_connect(false).await
+    }
+
+    async fn connect_with_extended_connect(
+        &self,
+        extended_connect: bool,
     ) -> (
         quinn::Endpoint,
         h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
@@ -109,7 +147,12 @@ impl TestServer {
             .expect("start QUIC connection")
             .await
             .expect("complete QUIC connection");
-        let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        let mut builder = h3::client::builder();
+        if extended_connect {
+            builder.enable_datagram(true).enable_extended_connect(true);
+        }
+        let (mut driver, sender) = builder
+            .build(h3_quinn::Connection::new(connection))
             .await
             .expect("build H3 client");
         let driver = tokio::spawn(async move {
@@ -118,6 +161,41 @@ impl TestServer {
 
         (endpoint, sender, driver)
     }
+}
+
+#[cfg(feature = "webtransport")]
+#[tokio::test]
+async fn webtransport_connect_is_dispatched_through_the_axum_router() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let app = Router::new().route(
+            "/wt",
+            axum::routing::any(|_upgrade: h3_axum::WebTransportUpgrade| async {
+                // Leaving the upgrade unclaimed exercises the rejection path:
+                // Axum's response is sent and ownership returns to the driver.
+                StatusCode::IM_A_TEAPOT
+            }),
+        );
+        let server = TestServer::spawn_with_connection_driver(app, true).await;
+        let (_endpoint, mut sender, _driver) = server.connect_with_extended_connect(true).await;
+
+        let mut request = http::Request::connect("https://localhost/wt")
+            .body(())
+            .expect("build WebTransport CONNECT request");
+        request
+            .extensions_mut()
+            .insert(h3::ext::Protocol::WEB_TRANSPORT);
+
+        let mut stream = sender
+            .send_request(request)
+            .await
+            .expect("send WebTransport CONNECT request");
+        stream.finish().await.expect("finish CONNECT request");
+
+        let response = stream.recv_response().await.expect("receive response");
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    })
+    .await
+    .expect("WebTransport routing test reached its declared deadline");
 }
 
 impl Drop for TestServer {
