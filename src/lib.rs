@@ -21,11 +21,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::error::Error;
+use std::{
+    error::Error,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::{Buf, Bytes};
 use http::{Request, Response};
-use http_body_util;
+use http_body::{Body, Frame};
 
 /// Boxed error type
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -49,32 +53,79 @@ pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 /// }
 /// ```
 pub fn is_graceful_h3_close(err: &h3::error::ConnectionError) -> bool {
-    // Check error string representation for graceful close patterns
-    // Since h3 error types are private/non-exhaustive, string matching is idiomatic.
-    // Common graceful close patterns from production:
-    // - Remote(Undefined(ConnectionClosed { error_code: NO_ERROR, ... }))
-    // - ApplicationClose: 0x0 - QUIC NO_ERROR application close
-    let err_debug = format!("{:?}", err);
+    err.is_h3_no_error()
+}
 
-    if err_debug.contains("NO_ERROR")
-        || err_debug.contains("ApplicationClose: 0x0")
-        || err_debug.contains("ApplicationClose(0x0)")
-        || err_debug.contains("ConnectionClosed")
-    {
-        return true;
-    }
+/// An Axum request body backed directly by an HTTP/3 receive stream.
+///
+/// Keeping the request body on the QUIC stream preserves transport
+/// backpressure and lets a handler start producing a response before the
+/// request body has been fully received.
+struct H3RequestBody<S>
+where
+    S: h3::quic::RecvStream,
+{
+    stream: h3::server::RequestStream<S, Bytes>,
+    data_complete: bool,
+    trailers_complete: bool,
+}
 
-    // Walk error source chain for typed QUIC-level causes
-    let mut cur: &(dyn std::error::Error + 'static) = err;
-    while let Some(src) = cur.source() {
-        let src_debug = format!("{:?}", src);
-        if src_debug.contains("NO_ERROR") || src_debug.contains("ApplicationClose") {
-            return true;
+impl<S> H3RequestBody<S>
+where
+    S: h3::quic::RecvStream,
+{
+    fn new(stream: h3::server::RequestStream<S, Bytes>) -> Self {
+        Self {
+            stream,
+            data_complete: false,
+            trailers_complete: false,
         }
-        cur = src;
     }
+}
 
-    false
+impl<S> Body for H3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Unpin,
+{
+    type Data = Bytes;
+    type Error = h3::error::StreamError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if !self.data_complete {
+            match self.stream.poll_recv_data(cx) {
+                Poll::Ready(Ok(Some(mut chunk))) => {
+                    let bytes = chunk.copy_to_bytes(chunk.remaining());
+                    return Poll::Ready(Some(Ok(Frame::data(bytes))));
+                }
+                Poll::Ready(Ok(None)) => self.data_complete = true,
+                Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.trailers_complete {
+            return Poll::Ready(None);
+        }
+
+        match self.stream.poll_recv_trailers(cx) {
+            Poll::Ready(Ok(Some(trailers))) => {
+                self.trailers_complete = true;
+                Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+            }
+            Poll::Ready(Ok(None)) => {
+                self.trailers_complete = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Err(error)) => {
+                self.trailers_complete = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Serve an Axum Router over an H3 request.
@@ -100,32 +151,17 @@ pub async fn serve_h3_with_axum<Q>(
 ) -> Result<(), BoxError>
 where
     Q: h3::quic::Connection<Bytes>,
+    Q::BidiStream: h3::quic::BidiStream<Bytes>,
+    <Q::BidiStream as h3::quic::BidiStream<Bytes>>::RecvStream: Send + Unpin + 'static,
 {
     // Resolve the H3 request
-    let (request_head, mut stream) = resolver.resolve_request().await?;
-
-    // Read request body from H3
-    let mut body_bytes = bytes::BytesMut::new();
-    loop {
-        match stream.recv_data().await {
-            Ok(Some(mut chunk)) => {
-                body_bytes.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
-            }
-            Ok(None) => break,
-            Err(e) => {
-                // Send 400 Bad Request on body read error
-                let mut error_response: Response<()> = Response::new(());
-                *error_response.status_mut() = http::StatusCode::BAD_REQUEST;
-                let _ = stream.send_response(error_response).await;
-                let _ = stream.finish().await;
-                return Err(Box::new(e));
-            }
-        }
-    }
+    let (request_head, stream) = resolver.resolve_request().await?;
+    let (mut send_stream, recv_stream) = stream.split();
 
     // Build Axum request
     let (parts, _) = request_head.into_parts();
-    let axum_req = Request::from_parts(parts, axum::body::Body::from(body_bytes.freeze()));
+    let body = axum::body::Body::new(H3RequestBody::new(recv_stream));
+    let axum_req = Request::from_parts(parts, body);
 
     // Call Axum router
     let axum_resp = tower::ServiceExt::oneshot(app, axum_req).await?;
@@ -133,20 +169,25 @@ where
     // Send response back over H3
     let (parts, axum_body) = axum_resp.into_parts();
     let head_only: Response<()> = Response::from_parts(parts, ());
-    stream.send_response(head_only).await?;
+    send_stream.send_response(head_only).await?;
 
-    // Stream response body chunk by chunk for SSE support
+    // Forward each body frame so streaming responses retain backpressure and
+    // response trailers are not discarded.
     let mut body_stream = std::pin::pin!(axum_body);
     while let Some(frame_result) = http_body_util::BodyExt::frame(&mut body_stream).await {
         let frame = frame_result?;
-        if let Some(chunk) = frame.data_ref() {
-            if !chunk.is_empty() {
-                stream.send_data(chunk.clone().into()).await?;
+        match frame.into_data() {
+            Ok(chunk) if !chunk.is_empty() => send_stream.send_data(chunk).await?,
+            Ok(_) => {}
+            Err(frame) => {
+                if let Ok(trailers) = frame.into_trailers() {
+                    send_stream.send_trailers(trailers).await?;
+                }
             }
         }
     }
 
-    stream.finish().await?;
+    send_stream.finish().await?;
 
     Ok(())
 }

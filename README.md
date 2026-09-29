@@ -1,6 +1,6 @@
 # h3-axum
 
-Direct h3 → Axum. No middleman. Just an adapter.
+Direct `h3` → Axum. No listener or TLS policy hidden in the middle.
 
 > With HTTP/3, the web is a **transport**, not just a verbs API.
 
@@ -35,9 +35,9 @@ That's it. Direct h3 → Axum.
 
 --- 
 
-# # What h3-axum Provides
+## What h3-axum Provides
 
-Just the adapter:
+The crate adapts one resolved HTTP/3 request stream to an Axum `Router`:
 
 ```rust
 // Bridge h3 ↔ Axum
@@ -48,6 +48,32 @@ if h3_axum::is_graceful_h3_close( & err) { /* ... */ }
 ```
 
 That's the entire library.
+
+The bridge preserves the HTTP message rather than collecting it into one
+buffer:
+
+- request data is exposed to Axum as a streaming body;
+- a handler may start its response before the request body is complete;
+- response data is forwarded frame by frame, including long-lived SSE bodies;
+- request and response trailers are preserved; and
+- QUIC flow control remains the source of backpressure in both directions.
+
+Connection acceptance, TLS and QUIC configuration, task ownership, graceful
+shutdown, and application policy remain with the caller. In particular,
+applications decide whether a request is safe to process as 0-RTT data. A
+future `h3` release is expected to expose that stream metadata directly; the
+adapter will surface it through Axum request extensions when it is available
+from the published dependency.
+
+The required upstream work is already merged:
+
+- [`hyperium/h3#323`](https://github.com/hyperium/h3/pull/323) exposes 0-RTT
+  state on each request stream. Once released, `h3-axum` can attach that state
+  to the Axum request without guessing whether a method is idempotent.
+- [`hyperium/h3#336`](https://github.com/hyperium/h3/pull/336) preserves QUIC
+  `ConnectionClosed` errors as structured values. The adapter already uses
+  `ConnectionError::is_h3_no_error()`, so a dependency update will extend its
+  graceful-close classification without debug-string parsing.
 
 ---
 

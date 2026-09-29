@@ -16,11 +16,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
-    Router,
 };
 use bytes::Bytes;
 use h3_quinn::quinn;
@@ -114,15 +114,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // See: https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config
-        .max_concurrent_bidi_streams(100_u32.into())   // Max concurrent HTTP requests
-        .max_concurrent_uni_streams(100_u32.into())    // Max concurrent unidirectional streams
-        .max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));  // Connection timeout
+        .max_concurrent_bidi_streams(100_u32.into()) // Max concurrent HTTP requests
+        .max_concurrent_uni_streams(100_u32.into()) // Max concurrent unidirectional streams
+        .max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?)); // Connection timeout
 
     // Bind and listen
     let addr: SocketAddr = "127.0.0.1:4433".parse()?;
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
 
-    tracing::info!("HTTP/3 server with Axum Router listening on https://{}", addr);
+    tracing::info!(
+        "HTTP/3 server with Axum Router listening on https://{}",
+        addr
+    );
     tracing::info!("Try:");
     tracing::info!("  curl --http3-only -k https://localhost:4433/");
     tracing::info!("  curl --http3-only -k https://localhost:4433/users");
